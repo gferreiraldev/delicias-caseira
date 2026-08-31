@@ -3,7 +3,7 @@ import re
 import secrets
 from decimal import Decimal, InvalidOperation
 from functools import wraps
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -27,7 +27,7 @@ app.config.update(
 )
 app.jinja_env.autoescape = True
 
-DATABASE_URL = os.environ.get("SUPABASE_DATABASE_URL") or os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get("SUPABASE_POOLER_URL") or os.environ.get("SUPABASE_DATABASE_URL") or os.environ.get("DATABASE_URL")
 ADMIN_PHONE = re.sub(r"\D", "", os.environ.get("ADMIN_PHONE", ""))
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 DEFAULT_WHATSAPP = re.sub(r"\D", "", os.environ.get("WHATSAPP_NUMBER", "5519981895884"))
@@ -41,10 +41,33 @@ DEFAULT_PRODUCTS = [
 ]
 
 
-def db():
+def database_connection_url():
     if not DATABASE_URL:
         raise RuntimeError("SUPABASE_DATABASE_URL não configurada")
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, sslmode="require")
+
+    parts = urlsplit(DATABASE_URL)
+    hostname = (parts.hostname or "").lower()
+    if not (hostname.startswith("db.") and hostname.endswith(".supabase.co")):
+        return DATABASE_URL
+
+    project_ref = hostname[3 : -len(".supabase.co")]
+    region = os.environ.get("SUPABASE_POOLER_REGION", "sa-east-1")
+    raw_auth = parts.netloc.rsplit("@", 1)[0] if "@" in parts.netloc else "postgres"
+    raw_user, separator, raw_password = raw_auth.partition(":")
+    if unquote(raw_user) == "postgres":
+        raw_user = f"postgres.{project_ref}"
+    auth = raw_user + (separator + raw_password if separator else "")
+    pooler_host = f"aws-0-{region}.pooler.supabase.com:6543"
+    return urlunsplit((parts.scheme or "postgresql", f"{auth}@{pooler_host}", parts.path or "/postgres", parts.query, parts.fragment))
+
+
+def db():
+    return psycopg2.connect(
+        database_connection_url(),
+        cursor_factory=RealDictCursor,
+        sslmode="require",
+        connect_timeout=int(os.environ.get("DB_CONNECT_TIMEOUT", "10")),
+    )
 
 
 def ensure_catalog(cur):
