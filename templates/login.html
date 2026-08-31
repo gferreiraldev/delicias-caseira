@@ -1,0 +1,22 @@
+{% extends 'base.html' %}
+{% block title %}{{ 'Criar conta' if mode == 'register' else 'Entrar' }} · Delícias Caseira{% endblock %}
+{% block content %}
+<main class="auth-page">
+  <section class="auth-card" aria-labelledby="auth-title">
+    <div class="brand-mark">DC</div>
+    <p class="eyebrow">doces que encantam</p>
+    <nav class="auth-nav" aria-label="Acesso à conta"><a class="button {{ 'primary' if mode == 'login' else 'outline' }}" href="{{ url_for('login') }}">Entrar</a><a class="button {{ 'primary' if mode == 'register' else 'outline' }}" href="{{ url_for('register') }}">Criar conta</a></nav>
+    <h1 id="auth-title">{{ 'Sua doce conta começa aqui' if mode == 'register' else 'Que bom ter você de volta' }}</h1>
+    <p class="muted">Peça suas sobremesas favoritas com praticidade.</p>
+    <form method="post" class="stack-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      {% if mode == 'register' %}<label>Nome completo<input name="name" required minlength="3" autocomplete="name"></label>{% endif %}
+      <label>WhatsApp<input name="phone" required inputmode="tel" autocomplete="tel" placeholder="(19) 99999-9999"></label>
+      <label>Senha<input name="password" type="password" required minlength="8" autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}"></label>
+      {% if mode == 'register' %}<label>Chave administrativa <span class="hint">opcional — use somente se a loja autorizou seu telefone para administrar o sistema</span><input name="admin_key" type="password" autocomplete="off" aria-describedby="admin-key-help"></label><small id="admin-key-help" class="field-help">Clientes comuns devem deixar este campo vazio.</small>{% endif %}
+      <button class="button primary" type="submit">{{ 'Criar minha conta' if mode == 'register' else 'Entrar no cardápio' }}</button>
+    </form>
+    <p class="switch-auth">{% if mode == 'register' %}Já tem conta? <a class="button-link" href="{{ url_for('login') }}">Entrar agora</a>{% else %}Ainda não tem conta? <a class="button-link" href="{{ url_for('register') }}">Criar minha conta</a>{% endif %}</p>
+  </section>
+</main>
+{% endblock %}
