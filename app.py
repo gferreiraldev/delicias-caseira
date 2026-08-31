@@ -3,7 +3,9 @@ import re
 import secrets
 from decimal import Decimal, InvalidOperation
 from functools import wraps
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -24,10 +26,15 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("FLASK_ENV") == "production",
+    MAX_CONTENT_LENGTH=5 * 1024 * 1024,
 )
 app.jinja_env.autoescape = True
 
 DATABASE_URL = os.environ.get("SUPABASE_POOLER_URL") or os.environ.get("SUPABASE_DATABASE_URL") or os.environ.get("DATABASE_URL")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_STORAGE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or ""
+SUPABASE_STORAGE_BUCKET = os.environ.get("SUPABASE_STORAGE_BUCKET", "site-images").strip().lower().replace(" ", "-")
+SUPABASE_USE_STORAGE_IMAGES = os.environ.get("SUPABASE_USE_STORAGE_IMAGES", "true").lower() in {"1", "true", "yes", "on"}
 ADMIN_PHONE = re.sub(r"\D", "", os.environ.get("ADMIN_PHONE", ""))
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 DEFAULT_WHATSAPP = re.sub(r"\D", "", os.environ.get("WHATSAPP_NUMBER", "5519981895884"))
@@ -123,11 +130,69 @@ def normalize_phone(value):
     return re.sub(r"\D", "", value or "")
 
 
+def supabase_project_url():
+    if SUPABASE_URL:
+        return SUPABASE_URL
+    parts = urlsplit(DATABASE_URL or "")
+    hostname = (parts.hostname or "").lower()
+    if hostname.startswith("db.") and hostname.endswith(".supabase.co"):
+        return f"https://{hostname[3 : -len('.supabase.co')]}.supabase.co"
+    return ""
+
+
+def storage_public_prefix():
+    return f"{supabase_project_url()}/storage/v1/object/public/{quote(SUPABASE_STORAGE_BUCKET, safe='')}/"
+
+
 def sanitize_image_url(value):
     candidate = str(value or "")
     if candidate.startswith("/static/images/") and ".." not in candidate and "\\" not in candidate:
+        if SUPABASE_USE_STORAGE_IMAGES and storage_public_prefix():
+            filename = quote(candidate.rsplit("/", 1)[-1], safe="")
+            return str(escape(f"{storage_public_prefix()}{filename}"))
+        return str(escape(candidate))
+    if storage_public_prefix() and candidate.startswith(storage_public_prefix()):
         return str(escape(candidate))
     return "/static/images/cardapio.jpeg"
+
+
+def upload_product_image(file_storage):
+    if not file_storage or not file_storage.filename:
+        return None
+    if not SUPABASE_STORAGE_KEY or not supabase_project_url():
+        raise ValueError("Configure SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY para enviar imagens.")
+    allowed_types = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+    content_type = (file_storage.mimetype or "").lower()
+    extension = allowed_types.get(content_type)
+    if not extension:
+        raise ValueError("Selecione uma imagem JPG, PNG ou WEBP.")
+    image_data = file_storage.read()
+    if not image_data:
+        raise ValueError("O arquivo de imagem está vazio.")
+    object_path = f"products/{secrets.token_hex(16)}{extension}"
+    bucket = quote(SUPABASE_STORAGE_BUCKET, safe="")
+    path = quote(object_path, safe="/")
+    endpoint = f"{supabase_project_url()}/storage/v1/object/{bucket}/{path}"
+    upload_request = Request(
+        endpoint,
+        data=image_data,
+        headers={
+            "Authorization": f"Bearer {SUPABASE_STORAGE_KEY}",
+            "apikey": SUPABASE_STORAGE_KEY,
+            "Content-Type": content_type,
+            "Cache-Control": "31536000",
+            "x-upsert": "false",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(upload_request, timeout=20) as response:
+            if response.status not in {200, 201}:
+                raise ValueError("O Storage recusou o upload da imagem.")
+    except (HTTPError, URLError, TimeoutError) as error:
+        detail = getattr(error, "reason", "erro de comunicação")
+        raise ValueError(f"Não foi possível enviar a imagem para o Storage: {detail}") from error
+    return f"{supabase_project_url()}/storage/v1/object/public/{bucket}/{path}"
 
 
 def money(value):
@@ -136,6 +201,30 @@ def money(value):
 
 def calculate_total(subtotal):
     return Decimal(subtotal)
+
+
+def product_form_data(form):
+    name = form.get("name", "").strip()
+    description = form.get("description", "").strip()
+    category = form.get("category", "").strip()
+    image_url = form.get("image_url", "").strip() or "/static/images/cardapio.jpeg"
+    try:
+        price = Decimal(form.get("price", "").replace(",", "."))
+        if price < 0:
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        raise ValueError("Preço inválido.")
+    if len(name) < 2:
+        raise ValueError("Informe um nome válido para o produto.")
+    if len(category) < 2:
+        raise ValueError("Informe uma categoria válida.")
+    if len(description) > 500:
+        raise ValueError("A descrição deve ter no máximo 500 caracteres.")
+    allowed_local = image_url.startswith("/static/images/") and ".." not in image_url and "\\" not in image_url
+    allowed_storage = storage_public_prefix() and image_url.startswith(storage_public_prefix())
+    if not (allowed_local or allowed_storage):
+        image_url = "/static/images/cardapio.jpeg"
+    return name, description, price, category, image_url
 
 
 app.jinja_env.filters["money"] = money
@@ -322,20 +411,46 @@ def update_order(order_id, status):
     return redirect(url_for("admin"))
 
 
+@app.route("/admin/produto/adicionar", methods=["POST"])
+@admin_required
+def add_product():
+    try:
+        name, description, price, category, image_url = product_form_data(request.form)
+        image_url = upload_product_image(request.files.get("image")) or image_url
+    except ValueError as error:
+        flash(str(error), "error")
+        return redirect(url_for("admin"))
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO products (name, description, price, category, image_url, is_active) VALUES (%s, %s, %s, %s, %s, TRUE)", (name, description, price, category, image_url))
+        conn.commit()
+    flash("Produto adicionado ao cardápio.", "success")
+    return redirect(url_for("admin"))
+
+
 @app.route("/admin/produto/<int:product_id>", methods=["POST"])
 @admin_required
 def update_product(product_id):
     try:
-        price = Decimal(request.form.get("price", "0").replace(",", "."))
-        if price < 0:
-            raise InvalidOperation
-    except (InvalidOperation, ValueError):
-        flash("Preço inválido.", "error")
+        name, description, price, category, image_url = product_form_data(request.form)
+        image_url = upload_product_image(request.files.get("image")) or image_url
+    except ValueError as error:
+        flash(str(error), "error")
         return redirect(url_for("admin"))
     active = request.form.get("is_active") == "on"
     with db() as conn, conn.cursor() as cur:
-        cur.execute("UPDATE products SET price = %s, is_active = %s WHERE id = %s", (price, active, product_id))
+        cur.execute("UPDATE products SET name = %s, description = %s, price = %s, category = %s, image_url = %s, is_active = %s WHERE id = %s", (name, description, price, category, image_url, active, product_id))
         conn.commit()
+    flash("Produto atualizado.", "success")
+    return redirect(url_for("admin"))
+
+
+@app.route("/admin/produto/<int:product_id>/remover", methods=["POST"])
+@admin_required
+def remove_product(product_id):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE products SET is_active = FALSE WHERE id = %s", (product_id,))
+        conn.commit()
+    flash("Produto removido do cardápio. O histórico de pedidos foi preservado.", "success")
     return redirect(url_for("admin"))
 
 

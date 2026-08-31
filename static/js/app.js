@@ -1,5 +1,4 @@
 document.addEventListener('DOMContentLoaded', () => {
-  // 1. Esconder mensagens Flash automaticamente
   document.querySelectorAll('.flash').forEach((element) => {
     window.setTimeout(() => {
       element.style.opacity = '0';
@@ -8,57 +7,92 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 4200);
   });
 
-  // 2. Botões de Quantidade (+ e -) no Cardápio e no Carrinho
-  document.querySelectorAll('.quantity-control').forEach((control) => {
-    const input = control.querySelector('input');
-    if (!input) return;
-
-    control.querySelector('.qty-minus')?.addEventListener('click', () => {
-      input.value = Math.max(1, Number(input.value || 1) - 1);
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-
-    control.querySelector('.qty-plus')?.addEventListener('click', () => {
-      input.value = Math.min(99, Number(input.value || 1) + 1);
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-  });
-
-  // 3. Formatador e Atualizador do Carrinho
   const currency = (value) =>
     new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(value);
+  const cart = document.querySelector('[data-cart-open]');
+  const panel = document.querySelector('#carrinho');
+  const backdrop = document.querySelector('.cart-backdrop');
+  let totalFrame;
+
+  const cartRows = () => document.querySelectorAll('.cart-row[data-unit-price]');
 
   const updateCartTotal = () => {
     let subtotal = 0;
-
-    // Sumariza apenas as linhas válidas do carrinho
-    document.querySelectorAll('.cart-row[data-unit-price]').forEach((row) => {
-      const unit = Number(row.dataset.unitPrice || 0);
-      const quantity = Number(row.querySelector('input')?.value || 0);
-      subtotal += unit * quantity;
+    let itemCount = 0;
+    cartRows().forEach((row) => {
+      const input = row.querySelector('input');
+      const quantity = Math.max(0, Math.min(99, Number(input?.value || 0)));
+      subtotal += Number(row.dataset.unitPrice || 0) * quantity;
+      itemCount += quantity;
     });
-
     const subtotalNode = document.querySelector('[data-cart-subtotal]');
     const totalNode = document.querySelector('[data-cart-total]');
-    
-    // Busca elemento com [data-delivery] se existir, senão assume taxa 0
-    const deliveryNode = document.querySelector('[data-delivery]');
-    const delivery = deliveryNode ? Number(deliveryNode.dataset.delivery || 0) : 0;
-
     if (subtotalNode) subtotalNode.textContent = currency(subtotal);
-    if (totalNode) totalNode.textContent = currency(subtotal + delivery);
+    if (totalNode) totalNode.textContent = currency(subtotal);
+    document.querySelectorAll('[data-cart-count]').forEach((node) => { node.textContent = itemCount; });
+    document.querySelectorAll('.cart-title-count').forEach((node) => { node.textContent = `(${itemCount})`; });
   };
 
-  // Recalcular quando digita ou altera o número no input do carrinho
-  document.querySelectorAll('.cart-row input').forEach((input) => {
-    input.addEventListener('input', updateCartTotal);
-    input.addEventListener('change', updateCartTotal);
+  const scheduleTotal = () => {
+    window.cancelAnimationFrame(totalFrame);
+    totalFrame = window.requestAnimationFrame(updateCartTotal);
+  };
+
+  const setCartOpen = (open) => {
+    if (!panel) return;
+    panel.classList.toggle('is-open', open);
+    panel.setAttribute('aria-hidden', String(!open));
+    backdrop?.classList.toggle('is-visible', open);
+    document.body.classList.toggle('cart-open', open);
+    cart?.setAttribute('aria-expanded', String(open));
+    if (open) panel.querySelector('.cart-close')?.focus({ preventScroll: true });
+  };
+
+  cart?.addEventListener('click', () => setCartOpen(true));
+  document.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    if (target.closest('[data-cart-close]')) setCartOpen(false);
+
+    const quantityButton = target.closest('.qty-minus, .qty-plus, .cart-qty-minus, .cart-qty-plus');
+    if (quantityButton) {
+      const control = quantityButton.closest('.quantity-control, .cart-qty-control');
+      const input = control?.querySelector('input');
+      if (!input) return;
+      const current = Number(input.value || 1);
+      const minimum = input.closest('.cart-qty-control') ? 0 : 1;
+      input.value = String(Math.max(minimum, Math.min(99, current + (quantityButton.classList.contains('qty-minus') || quantityButton.classList.contains('cart-qty-minus') ? -1 : 1))));
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    const removeButton = target.closest('[data-remove-cart-item]');
+    if (removeButton) {
+      const row = removeButton.closest('[data-product-row]');
+      const input = row?.querySelector('input');
+      if (row && input) {
+        input.value = '0';
+        row.classList.add('is-removing');
+        row.setAttribute('aria-hidden', 'true');
+        row.style.display = 'none';
+        scheduleTotal();
+      }
+    }
   });
 
-  // Roda o cálculo inicial ao carregar a página
+  backdrop?.addEventListener('click', () => setCartOpen(false));
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && panel?.classList.contains('is-open')) setCartOpen(false);
+  });
+  document.addEventListener('input', (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement)) return;
+    if (!target.closest('.cart-row')) return;
+    target.value = String(Math.max(0, Math.min(99, Number(target.value || 0))));
+    scheduleTotal();
+  });
+
   updateCartTotal();
 
-  // 4. Confirmação nos botões do Painel Administrativo
   document.querySelectorAll('form[action*="/admin/pedido/"]').forEach((form) => {
     form.addEventListener('submit', (event) => {
       const button = form.querySelector('button');
