@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import secrets
@@ -12,6 +13,7 @@ from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
 from markupsafe import escape
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.security import check_password_hash, generate_password_hash
 
 load_dotenv()
@@ -98,6 +100,12 @@ def csrf_token():
 app.jinja_env.globals["csrf_token"] = csrf_token
 
 
+@app.errorhandler(RequestEntityTooLarge)
+def too_large(_error):
+    flash("Imagem muito grande. Envie um arquivo de até 5 MB.", "error")
+    return redirect(url_for("admin") if session.get("is_admin") else url_for("index"))
+
+
 @app.before_request
 def validate_csrf():
     if request.method == "POST":
@@ -141,19 +149,92 @@ def supabase_project_url():
 
 
 def storage_public_prefix():
-    return f"{supabase_project_url()}/storage/v1/object/public/{quote(SUPABASE_STORAGE_BUCKET, safe='')}/"
+    project_url = supabase_project_url()
+    if not project_url:
+        return ""
+    return f"{project_url}/storage/v1/object/public/{quote(SUPABASE_STORAGE_BUCKET, safe='')}/"
 
 
 def sanitize_image_url(value):
     candidate = str(value or "")
+    prefix = storage_public_prefix()
     if candidate.startswith("/static/images/") and ".." not in candidate and "\\" not in candidate:
-        if SUPABASE_USE_STORAGE_IMAGES and storage_public_prefix():
+        if SUPABASE_USE_STORAGE_IMAGES and prefix:
             filename = quote(candidate.rsplit("/", 1)[-1], safe="")
-            return str(escape(f"{storage_public_prefix()}{filename}"))
+            return str(escape(f"{prefix}{filename}"))
         return str(escape(candidate))
-    if storage_public_prefix() and candidate.startswith(storage_public_prefix()):
+    if prefix and candidate.startswith(prefix):
         return str(escape(candidate))
     return "/static/images/cardapio.jpeg"
+
+
+IMAGE_SIGNATURES = (
+    (b"\xff\xd8\xff", "image/jpeg", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png", ".png"),
+)
+_bucket_checked = False
+
+
+def detect_image_type(data):
+    for signature, content_type, extension in IMAGE_SIGNATURES:
+        if data.startswith(signature):
+            return content_type, extension
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    return None, None
+
+
+def storage_request(method, path, data=None, content_type=None, extra_headers=None):
+    headers = {"Authorization": f"Bearer {SUPABASE_STORAGE_KEY}", "apikey": SUPABASE_STORAGE_KEY}
+    if content_type:
+        headers["Content-Type"] = content_type
+    headers.update(extra_headers or {})
+    req = Request(f"{supabase_project_url()}/storage/v1/{path}", data=data, headers=headers, method=method)
+    try:
+        with urlopen(req, timeout=20) as response:
+            return response.status, response.read().decode("utf-8", "replace")
+    except HTTPError as error:
+        return error.code, error.read().decode("utf-8", "replace")
+    except (URLError, TimeoutError) as error:
+        raise ValueError(f"Não foi possível conectar ao Supabase Storage: {getattr(error, 'reason', error)}") from error
+
+
+def storage_error(status, body):
+    try:
+        info = json.loads(body)
+        detail = info.get("message") or info.get("error") or body
+    except ValueError:
+        detail = body
+    detail = str(detail)[:200]
+    if status in {401, 403} or "row-level security" in detail.lower() or "jwt" in detail.lower():
+        return ValueError(f"Chave do Supabase sem permissão ({detail}). Use a SERVICE ROLE / secret key em SUPABASE_SERVICE_ROLE_KEY.")
+    return ValueError(f"O Storage recusou a imagem (HTTP {status}): {detail}")
+
+
+def ensure_bucket():
+    global _bucket_checked
+    if _bucket_checked:
+        return
+    bucket = quote(SUPABASE_STORAGE_BUCKET, safe="")
+    status, body = storage_request("GET", f"bucket/{bucket}")
+    if status == 200:
+        try:
+            is_public = json.loads(body).get("public")
+        except ValueError:
+            is_public = True
+        if not is_public:
+            payload = json.dumps({"public": True}).encode()
+            status, body = storage_request("PUT", f"bucket/{bucket}", payload, "application/json")
+            if status not in {200, 201}:
+                raise storage_error(status, body)
+    elif status in {400, 404}:
+        payload = json.dumps({"id": SUPABASE_STORAGE_BUCKET, "name": SUPABASE_STORAGE_BUCKET, "public": True}).encode()
+        status, body = storage_request("POST", "bucket", payload, "application/json")
+        if status not in {200, 201} and "already exists" not in body.lower():
+            raise storage_error(status, body)
+    else:
+        raise storage_error(status, body)
+    _bucket_checked = True
 
 
 def upload_product_image(file_storage):
@@ -161,38 +242,25 @@ def upload_product_image(file_storage):
         return None
     if not SUPABASE_STORAGE_KEY or not supabase_project_url():
         raise ValueError("Configure SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY para enviar imagens.")
-    allowed_types = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
-    content_type = (file_storage.mimetype or "").lower()
-    extension = allowed_types.get(content_type)
-    if not extension:
-        raise ValueError("Selecione uma imagem JPG, PNG ou WEBP.")
     image_data = file_storage.read()
     if not image_data:
         raise ValueError("O arquivo de imagem está vazio.")
-    object_path = f"products/{secrets.token_hex(16)}{extension}"
+    content_type, extension = detect_image_type(image_data)
+    if not content_type:
+        raise ValueError("Selecione uma imagem JPG, PNG ou WEBP.")
+    ensure_bucket()
     bucket = quote(SUPABASE_STORAGE_BUCKET, safe="")
-    path = quote(object_path, safe="/")
-    endpoint = f"{supabase_project_url()}/storage/v1/object/{bucket}/{path}"
-    upload_request = Request(
-        endpoint,
-        data=image_data,
-        headers={
-            "Authorization": f"Bearer {SUPABASE_STORAGE_KEY}",
-            "apikey": SUPABASE_STORAGE_KEY,
-            "Content-Type": content_type,
-            "Cache-Control": "31536000",
-            "x-upsert": "false",
-        },
-        method="POST",
+    path = quote(f"products/{secrets.token_hex(16)}{extension}", safe="/")
+    status, body = storage_request(
+        "POST",
+        f"object/{bucket}/{path}",
+        image_data,
+        content_type,
+        {"Cache-Control": "max-age=31536000", "x-upsert": "false"},
     )
-    try:
-        with urlopen(upload_request, timeout=20) as response:
-            if response.status not in {200, 201}:
-                raise ValueError("O Storage recusou o upload da imagem.")
-    except (HTTPError, URLError, TimeoutError) as error:
-        detail = getattr(error, "reason", "erro de comunicação")
-        raise ValueError(f"Não foi possível enviar a imagem para o Storage: {detail}") from error
-    return f"{supabase_project_url()}/storage/v1/object/public/{bucket}/{path}"
+    if status not in {200, 201}:
+        raise storage_error(status, body)
+    return f"{storage_public_prefix()}{path}"
 
 
 def money(value):
@@ -221,7 +289,8 @@ def product_form_data(form):
     if len(description) > 500:
         raise ValueError("A descrição deve ter no máximo 500 caracteres.")
     allowed_local = image_url.startswith("/static/images/") and ".." not in image_url and "\\" not in image_url
-    allowed_storage = storage_public_prefix() and image_url.startswith(storage_public_prefix())
+    prefix = storage_public_prefix()
+    allowed_storage = bool(prefix) and image_url.startswith(prefix)
     if not (allowed_local or allowed_storage):
         image_url = "/static/images/cardapio.jpeg"
     return name, description, price, category, image_url
