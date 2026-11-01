@@ -93,6 +93,53 @@ document.addEventListener('DOMContentLoaded', () => {
 
   updateCartTotal();
 
+  const MAX_SIDE = 1600;
+  const compressImage = (file) => new Promise((resolve) => {
+    if (!file || !file.type.startsWith('image/')) return resolve(file);
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, MAX_SIDE / Math.max(img.width, img.height));
+      if (scale === 1 && file.size < 1.5 * 1024 * 1024) { URL.revokeObjectURL(url); return resolve(file); }
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      canvas.toBlob((blob) => {
+        if (!blob) return resolve(file);
+        const name = file.name.replace(/\.[^.]+$/, '') + '.jpg';
+        resolve(new File([blob], name, { type: 'image/jpeg' }));
+      }, 'image/jpeg', 0.85);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(file); };
+    img.src = url;
+  });
+
+  document.querySelectorAll('input[type="file"][name="image"]').forEach((input) => {
+    input.addEventListener('change', async () => {
+      const original = input.files?.[0];
+      if (!original) return;
+      const form = input.form;
+      const submits = form ? [...form.querySelectorAll('button[type="submit"]'), ...(form.id ? document.querySelectorAll(`button[form="${form.id}"]`) : [])] : [];
+      submits.forEach((b) => { b.disabled = true; });
+      try {
+        const compressed = await compressImage(original);
+        if (compressed !== original && typeof DataTransfer !== 'undefined') {
+          const dt = new DataTransfer();
+          dt.items.add(compressed);
+          input.files = dt.files;
+        }
+        if (input.files[0].size > 5 * 1024 * 1024) {
+          alert('Imagem muito grande (máx. 5 MB). Escolha outra.');
+          input.value = '';
+        }
+      } finally {
+        submits.forEach((b) => { b.disabled = false; });
+      }
+    });
+  });
+
   document.querySelectorAll('form[action*="/admin/pedido/"]').forEach((form) => {
     form.addEventListener('submit', (event) => {
       const button = form.querySelector('button');
