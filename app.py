@@ -33,8 +33,8 @@ app.config.update(
 app.jinja_env.autoescape = True
 
 DATABASE_URL = os.environ.get("SUPABASE_POOLER_URL") or os.environ.get("SUPABASE_DATABASE_URL") or os.environ.get("DATABASE_URL")
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_STORAGE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or ""
+SUPABASE_URL = re.sub(r"/(rest|storage|auth)/v1.*$", "", os.environ.get("SUPABASE_URL", "").strip().strip('"').rstrip("/"))
+SUPABASE_STORAGE_KEY = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or "").strip().strip('"').strip("'")
 SUPABASE_STORAGE_BUCKET = os.environ.get("SUPABASE_STORAGE_BUCKET", "site-images").strip().lower().replace(" ", "-")
 SUPABASE_USE_STORAGE_IMAGES = os.environ.get("SUPABASE_USE_STORAGE_IMAGES", "true").lower() in {"1", "true", "yes", "on"}
 ADMIN_PHONE = re.sub(r"\D", "", os.environ.get("ADMIN_PHONE", ""))
@@ -202,13 +202,26 @@ def storage_request(method, path, data=None, content_type=None, extra_headers=No
 def storage_error(status, body):
     try:
         info = json.loads(body)
-        detail = info.get("message") or info.get("error") or body
     except ValueError:
-        detail = body
-    detail = str(detail)[:200]
-    if status in {401, 403} or "row-level security" in detail.lower() or "jwt" in detail.lower():
-        return ValueError(f"Chave do Supabase sem permissão ({detail}). Use a SERVICE ROLE / secret key em SUPABASE_SERVICE_ROLE_KEY.")
-    return ValueError(f"O Storage recusou a imagem (HTTP {status}): {detail}")
+        info = {}
+    inner = str(info.get("statusCode") or status)
+    detail = " - ".join(str(v) for v in (info.get("error"), info.get("message")) if v) or (body or "").strip()[:200] or "sem detalhes"
+    low = detail.lower()
+    if inner in {"401", "403"} or any(k in low for k in ("row-level security", "jwt", "jws", "signature", "unauthorized", "api key", "apikey")):
+        return ValueError(f"Chave do Supabase inválida ou sem permissão ({detail}). Em SUPABASE_SERVICE_ROLE_KEY use a chave service_role (ou secret), sem aspas nem espaços.")
+    if inner == "415" or "mime" in low:
+        return ValueError(f"O bucket '{SUPABASE_STORAGE_BUCKET}' não aceita esse tipo de arquivo ({detail}). No Supabase > Storage > bucket > Edit, limpe 'Allowed MIME types'.")
+    if inner == "413" or "maximum allowed size" in low:
+        return ValueError(f"O bucket '{SUPABASE_STORAGE_BUCKET}' tem limite de tamanho menor que a imagem ({detail}). Aumente 'File size limit' no bucket.")
+    return ValueError(f"O Storage recusou a imagem (HTTP {status}/{inner}): {detail}")
+
+
+def is_not_found(status, body):
+    try:
+        info = json.loads(body)
+    except ValueError:
+        info = {}
+    return status == 404 or str(info.get("statusCode")) == "404" or "not found" in (body or "").lower()
 
 
 def ensure_bucket():
@@ -227,7 +240,7 @@ def ensure_bucket():
             status, body = storage_request("PUT", f"bucket/{bucket}", payload, "application/json")
             if status not in {200, 201}:
                 raise storage_error(status, body)
-    elif status in {400, 404}:
+    elif is_not_found(status, body):
         payload = json.dumps({"id": SUPABASE_STORAGE_BUCKET, "name": SUPABASE_STORAGE_BUCKET, "public": True}).encode()
         status, body = storage_request("POST", "bucket", payload, "application/json")
         if status not in {200, 201} and "already exists" not in body.lower():
