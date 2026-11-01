@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import re
@@ -184,8 +185,29 @@ def detect_image_type(data):
     return None, None
 
 
+def check_storage_key():
+    key = SUPABASE_STORAGE_KEY
+    if key.startswith("sb_publishable_"):
+        raise ValueError("SUPABASE_SERVICE_ROLE_KEY está com a chave publishable. Use a chave secret (sb_secret_...).")
+    if key.count(".") != 2:
+        return
+    try:
+        part = key.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+    except (ValueError, TypeError):
+        raise ValueError("SUPABASE_SERVICE_ROLE_KEY não é uma chave válida do Supabase.")
+    role, ref = claims.get("role"), claims.get("ref")
+    url_ref = urlsplit(supabase_project_url()).hostname.split(".")[0] if supabase_project_url() else ""
+    if role != "service_role":
+        raise ValueError(f"SUPABASE_SERVICE_ROLE_KEY está com a chave '{role}'. Use a service_role.")
+    if ref and url_ref and ref != url_ref:
+        raise ValueError(f"A chave é do projeto '{ref}', mas SUPABASE_URL aponta para '{url_ref}'. Use URL e chave do mesmo projeto.")
+
+
 def storage_request(method, path, data=None, content_type=None, extra_headers=None):
-    headers = {"Authorization": f"Bearer {SUPABASE_STORAGE_KEY}", "apikey": SUPABASE_STORAGE_KEY}
+    headers = {"apikey": SUPABASE_STORAGE_KEY}
+    if not SUPABASE_STORAGE_KEY.startswith("sb_"):
+        headers["Authorization"] = f"Bearer {SUPABASE_STORAGE_KEY}"
     if content_type:
         headers["Content-Type"] = content_type
     headers.update(extra_headers or {})
@@ -208,7 +230,7 @@ def storage_error(status, body):
     detail = " - ".join(str(v) for v in (info.get("error"), info.get("message")) if v) or (body or "").strip()[:200] or "sem detalhes"
     low = detail.lower()
     if inner in {"401", "403"} or any(k in low for k in ("row-level security", "jwt", "jws", "signature", "unauthorized", "api key", "apikey")):
-        return ValueError(f"Chave do Supabase inválida ou sem permissão ({detail}). Em SUPABASE_SERVICE_ROLE_KEY use a chave service_role (ou secret), sem aspas nem espaços.")
+        return ValueError(f"Chave do Supabase recusada ({detail}). A chave antiga (JWT) pode ter sido rotacionada: gere/copie a secret key (sb_secret_...) em Project Settings > API Keys e coloque em SUPABASE_SERVICE_ROLE_KEY.")
     if inner == "415" or "mime" in low:
         return ValueError(f"O bucket '{SUPABASE_STORAGE_BUCKET}' não aceita esse tipo de arquivo ({detail}). No Supabase > Storage > bucket > Edit, limpe 'Allowed MIME types'.")
     if inner == "413" or "maximum allowed size" in low:
@@ -261,6 +283,7 @@ def upload_product_image(file_storage):
     content_type, extension = detect_image_type(image_data)
     if not content_type:
         raise ValueError("Selecione uma imagem JPG, PNG ou WEBP.")
+    check_storage_key()
     ensure_bucket()
     bucket = quote(SUPABASE_STORAGE_BUCKET, safe="")
     path = quote(f"products/{secrets.token_hex(16)}{extension}", safe="/")
